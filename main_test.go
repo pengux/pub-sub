@@ -4,12 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/julienschmidt/httprouter"
 	"github.com/pengux/pub-sub/pubsub"
@@ -18,13 +16,7 @@ import (
 var router *httprouter.Router
 
 func TestPubSub(t *testing.T) {
-	c, err := NewGnatsdConn(&GnatsdOptions)
-	if err != nil {
-		log.Fatal("Could not create an encoded connection to Gnatds server")
-	}
-	defer c.Close()
-
-	ps := pubsub.New(c)
+	ps := pubsub.New()
 
 	router = httprouter.New()
 	router = ps.SetupRoutes(router)
@@ -37,7 +29,7 @@ func TestPubSub(t *testing.T) {
 
 	// Publish without subscribers, this message should not be delivered after subscription
 	rec, _ := newRequest("POST", fmt.Sprintf("/%s", topic), strings.NewReader(`{"message": "should not be delivered"}`))
-	if rec.Code != http.StatusCreated {
+	if rec.Code != http.StatusNoContent {
 		t.Errorf("publishing to topic, expecting status code %d, got %d and body %s", http.StatusCreated, rec.Code, rec.Body.String())
 	}
 
@@ -59,15 +51,12 @@ func TestPubSub(t *testing.T) {
 		t.Errorf("publishing to topic, expecting status code %d, got %d and body %s", http.StatusCreated, rec.Code, rec.Body.String())
 	}
 
-	// Sleep to allow message to be propagated to subscribers
-	time.Sleep(50 * time.Millisecond)
-
 	// Polling with subscriber
 	rec, _ = newRequest("GET", fmt.Sprintf("/%s/%s", topic, subscriber1), nil)
 	if rec.Code != http.StatusOK {
 		t.Errorf("polling messages from topic with subscriber1, expecting status code %d, got %d and body %s", http.StatusOK, rec.Code, rec.Body.String())
 	}
-	err = json.Unmarshal(rec.Body.Bytes(), &msgs)
+	err := json.Unmarshal(rec.Body.Bytes(), &msgs)
 	if err != nil {
 		t.Errorf("unmarshal message from topic with subscriber1, got %s", err.Error())
 	}

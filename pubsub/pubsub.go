@@ -8,12 +8,14 @@ import (
 	"time"
 
 	"github.com/julienschmidt/httprouter"
-	"github.com/nats-io/nats"
 )
 
 type (
 	PubSub struct {
-		conn *nats.EncodedConn
+		// topics is a nested map containing subscribers and slices
+		// of Message for each topic
+		topics map[string]subscriptions
+		sync.Mutex
 	}
 
 	Message struct {
@@ -21,21 +23,12 @@ type (
 		Published time.Time `json:"published,omitempty"`
 	}
 
-	subscription struct {
-		sub  *nats.Subscription
-		msgs []Message
-		sync.Mutex
-	}
-)
-
-var (
-	subscriptions = make(map[string]*subscription)
-	mutex         = &sync.RWMutex{}
+	subscriptions map[string][]Message
 )
 
 // New returns a new PubSub instance with a Nats encoded connection
-func New(conn *nats.EncodedConn) *PubSub {
-	return &PubSub{conn}
+func New() *PubSub {
+	return &PubSub{topics: make(map[string]subscriptions)}
 }
 
 // SetupRoutes maps routes to the PubSub's handlers
@@ -51,6 +44,17 @@ func (ps *PubSub) SetupRoutes(router *httprouter.Router) *httprouter.Router {
 // PublishMessage send a message to all subscribers
 // POST /:topic_name
 func (ps *PubSub) PublishMessage(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
+	topic := p.ByName("topic_name")
+
+	ps.Lock()
+	defer ps.Unlock()
+
+	// If there is no subscribers to the topic, just return empty response
+	if _, ok := ps.topics[topic]; !ok {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	var msg Message
 	err := unmarshalBody(r, &msg)
 	if err != nil {
@@ -61,10 +65,8 @@ func (ps *PubSub) PublishMessage(w http.ResponseWriter, r *http.Request, p httpr
 	// Set message published time to server's time
 	msg.Published = time.Now()
 
-	err = ps.conn.Publish(p.ByName("topic_name"), &msg)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	for subscriber, _ := range ps.topics[topic] {
+		ps.topics[topic][subscriber] = append(ps.topics[topic][subscriber], msg)
 	}
 
 	w.WriteHeader(http.StatusCreated)
@@ -75,25 +77,15 @@ func (ps *PubSub) PublishMessage(w http.ResponseWriter, r *http.Request, p httpr
 // POST /:topic_name/:subscriber_name
 func (ps *PubSub) Subscribe(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
 	topic, subscriber := p.ByName("topic_name"), p.ByName("subscriber_name")
-	mapKey := topic + "." + subscriber
 
-	sub, err := ps.conn.Subscribe(topic, func(m *Message) {
-		subscriptions[mapKey].Lock()
-		subscriptions[mapKey].msgs = append(subscriptions[mapKey].msgs, *m)
-		subscriptions[mapKey].Unlock()
-	})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	ps.Lock()
+	defer ps.Unlock()
+	if _, ok := ps.topics[topic]; !ok {
+		ps.topics[topic] = make(map[string][]Message)
 	}
 
-	mutex.Lock()
-	defer mutex.Unlock()
-	if _, ok := subscriptions[mapKey]; !ok {
-		subscriptions[mapKey] = &subscription{
-			sub:  sub,
-			msgs: make([]Message, 0),
-		}
+	if _, ok := ps.topics[topic][subscriber]; !ok {
+		ps.topics[topic][subscriber] = make([]Message, 0)
 	}
 
 	w.WriteHeader(http.StatusCreated)
@@ -102,18 +94,25 @@ func (ps *PubSub) Subscribe(w http.ResponseWriter, r *http.Request, p httprouter
 // Unsubscribe removes a subscription of a topic.
 // DELETE /:topic_name/:subscriber_name
 func (ps *PubSub) Unsubscribe(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
-	mapKey := p.ByName("topic_name") + "." + p.ByName("subscriber_name")
+	topic, subscriber := p.ByName("topic_name"), p.ByName("subscriber_name")
 
-	mutex.Lock()
-	defer mutex.Unlock()
-	if _, ok := subscriptions[mapKey]; ok {
-		err := subscriptions[mapKey].sub.Unsubscribe()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+	ps.Lock()
+	defer ps.Unlock()
+	if _, ok := ps.topics[topic]; !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
 
-		delete(subscriptions, mapKey)
+	if _, ok := ps.topics[topic][subscriber]; !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	delete(ps.topics[topic], subscriber)
+
+	// If there are no more subscribers left, remove the topic too
+	if len(ps.topics[topic]) == 0 {
+		delete(ps.topics, topic)
 	}
 
 	w.WriteHeader(http.StatusNoContent)
@@ -122,24 +121,26 @@ func (ps *PubSub) Unsubscribe(w http.ResponseWriter, r *http.Request, p httprout
 // GetMessages returns published messages to the subscriber since subscription.
 // GET /:topic_name/:subscriber_name
 func (ps *PubSub) GetMessages(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
-	mapKey := p.ByName("topic_name") + "." + p.ByName("subscriber_name")
+	topic, subscriber := p.ByName("topic_name"), p.ByName("subscriber_name")
 
-	mutex.Lock()
-	defer mutex.Unlock()
-	if _, ok := subscriptions[mapKey]; !ok {
+	ps.Lock()
+	defer ps.Unlock()
+	if _, ok := ps.topics[topic]; !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	subscriptions[mapKey].Lock()
-	defer subscriptions[mapKey].Unlock()
-	if len(subscriptions[mapKey].msgs) == 0 {
+	if _, ok := ps.topics[topic][subscriber]; !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	if len(ps.topics[topic][subscriber]) == 0 {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	body, err := json.Marshal(subscriptions[mapKey].msgs)
-	subscriptions[mapKey].msgs = make([]Message, 0)
+	body, err := json.Marshal(ps.topics[topic][subscriber])
 	if err != nil {
 		http.Error(w, "Could not marshal messages in response", http.StatusInternalServerError)
 		return
@@ -150,6 +151,9 @@ func (ps *PubSub) GetMessages(w http.ResponseWriter, r *http.Request, p httprout
 		http.Error(w, "Could not write body of response", http.StatusInternalServerError)
 		return
 	}
+
+	// empty the message queue for the subscription
+	ps.topics[topic][subscriber] = make([]Message, 0)
 
 	w.WriteHeader(http.StatusOK)
 }

@@ -1,8 +1,5 @@
 # pub-sub
-Example of pub-sub using [Gnatsd](https://github.com/nats-io/gnatsd).
-
-## Description
-NATS is a high performant message queue which can be used as a messaging platform for distributed apps. It can also be embedded into a Go application making it easy to prototype and test (no need to run a separate server).
+Example of pub-sub in Go using simple maps
 
 ## How to run
 ```sh
@@ -34,7 +31,7 @@ go test -race
 }
 ```
 
-## TODO
-- Add unit tests
+## Improvements
+- Make the pub-sub non-locking
 - Add tests for concurrency
 - Use in a demo chat application
